@@ -1,124 +1,126 @@
-// The game's rules and state, with no drawing and no browser in it: the player's paddle, the
-// pool of falling blocks and coins, spawning, collisions, score, lives and level. step() advances
-// one fixed step and returns what happened as bit flags, so the caller can react without the
-// world knowing about screens or sound. Nothing here allocates after createWorld returns.
-import { BLOCK, COIN, FIELD, LEVEL, LIVES, PLAYER, POOL_SIZE } from './config.js';
+import { STEP } from './config.js';
+import { createCity } from './city.js';
+import { createCombatSystem } from './combat.js';
+import { createCamera } from './camera.js';
+import { createEffects } from './effects.js';
+import { createJobsSystem } from './jobs.js';
+import { createMissionSystem } from './missions.js';
+import { createPedSystem } from './peds.js';
+import { createPoliceSystem, createCrimeReporter } from './police.js';
+import { createPlayer, damagePlayer, exitVehicle, playerInteract, updatePlayer } from './player.js';
+import { createSaveSystem } from './save.js';
+import { createTrafficSystem } from './traffic.js';
+import { updateVehicles } from './vehicles.js';
+import { RADIO_STATIONS, WEAPON_PICKUPS } from './config.js';
+import { spawnWeaponPickups } from './weapons.js';
 
-export const KIND_BLOCK = 0;
-export const KIND_COIN = 1;
+export const SCREEN_PLAY = 'play';
 
-export const EVENT_HIT = 1;
-export const EVENT_COIN = 2;
-export const EVENT_OVER = 4;
+export function createWorld(seedRandom) {
+  const city = createCity(seedRandom);
+  const world = {
+    random: seedRandom,
+    city,
+    time: 0,
+    clock: 17 * 60,
+    radio: 0,
+    radioVisible: 0,
+    radioNames: RADIO_STATIONS.map(station => station.name),
+    notification: '',
+    notificationTimer: 0,
+    mapOpen: false,
+    screen: 'title',
+    vehicles: [],
+    peds: [],
+    input: null,
+    audio: null,
+    camera: null,
+    minimap: null,
+    missions: null,
+    jobs: null,
+    police: null,
+    save: null,
+  };
 
-function overlaps(a, b) {
-  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
-}
+  world.player = createPlayer(880, 990);
+  world.effects = createEffects();
+  world.traffic = createTrafficSystem(world);
+  world.peds = createPedSystem(world);
+  world.combat = null;
+  world.missions = createMissionSystem(world);
+  world.jobs = createJobsSystem(world);
+  world.police = createPoliceSystem(world);
+  world.crime = createCrimeReporter(world);
+  world.combat = createCombatSystem(world);
+  world.save = createSaveSystem(world);
+  spawnWeaponPickups(world.player.weaponState, seedRandom, [
+    { x: 980, y: 700 }, { x: 2290, y: 1340 }, { x: 2880, y: 2660 }, { x: 3720, y: 2330 },
+  ]);
 
-export function createWorld(random) {
-  const player = { x: 0, y: FIELD.groundY - PLAYER.height, width: PLAYER.width, height: PLAYER.height, invulnerable: 0 };
-  const items = [];
-  for (let index = 0; index < POOL_SIZE; index += 1) {
-    items.push({ active: false, kind: KIND_BLOCK, x: 0, y: 0, width: 0, height: 0, speed: 0 });
-  }
-  const state = { player, items, score: 0, lives: LIVES, level: 1, elapsed: 0, blockTimer: 0, coinTimer: 0 };
+  world.notify = message => {
+    world.notification = message;
+    world.notificationTimer = 3;
+  };
 
-  function reset() {
-    player.x = (FIELD.width - player.width) / 2;
-    player.invulnerable = 0;
-    for (const item of items) item.active = false;
-    state.score = 0;
-    state.lives = LIVES;
-    state.level = 1;
-    state.elapsed = 0;
-    state.blockTimer = BLOCK.interval;
-    state.coinTimer = COIN.interval;
-  }
+  world.wasted = () => {
+    world.screen = 'wasted';
+    world.player.cash = Math.floor(world.player.cash * 0.9);
+    world.player.health = 100;
+    world.player.x = 1650;
+    world.player.y = 2310;
+    exitVehicle(world.player, world, true);
+    world.police.clear();
+  };
 
-  function freeItem() {
-    for (let index = 0; index < items.length; index += 1) if (!items[index].active) return items[index];
-    return null;
-  }
+  world.busted = () => {
+    world.screen = 'busted';
+    world.player.cash = Math.max(0, world.player.cash - 250);
+    for (const slot of world.player.weaponState.slots) slot.ammo = Math.floor(slot.ammo / 2);
+    world.player.x = 2310;
+    world.player.y = 1320;
+    exitVehicle(world.player, world, true);
+    world.police.clear();
+  };
 
-  function spawnBlock() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_BLOCK;
-    item.width = BLOCK.minWidth + random() * (BLOCK.maxWidth - BLOCK.minWidth);
-    item.height = BLOCK.height;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = BLOCK.speed + BLOCK.speedPerLevel * (state.level - 1) + random() * BLOCK.speedJitter;
-  }
-
-  function spawnCoin() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_COIN;
-    item.width = COIN.size;
-    item.height = COIN.size;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = COIN.speed + COIN.speedPerLevel * (state.level - 1);
-  }
-
-  function blockInterval() {
-    return Math.max(BLOCK.minInterval, BLOCK.interval * BLOCK.intervalScale ** (state.level - 1));
-  }
-
-  /**
-   * One fixed step. `direction` is -1, 0 or 1 (left, still, right). With `harmless` set (the title
-   * screen's backdrop) things fall but nothing touches the player and nothing scores.
-   */
-  function step(dt, direction, harmless) {
-    let events = 0;
-    state.elapsed += dt;
-    state.level = Math.min(LEVEL.max, 1 + Math.floor(state.elapsed / LEVEL.seconds));
-
-    player.x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * dt));
-    if (player.invulnerable > 0) player.invulnerable = Math.max(0, player.invulnerable - dt);
-
-    state.blockTimer -= dt;
-    if (state.blockTimer <= 0) {
-      spawnBlock();
-      state.blockTimer += blockInterval();
-    }
-    state.coinTimer -= dt;
-    if (state.coinTimer <= 0) {
-      spawnCoin();
-      state.coinTimer += COIN.interval + random() * COIN.intervalJitter;
-    }
-
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index];
-      if (!item.active) continue;
-      item.y += item.speed * dt;
-      if (item.y > FIELD.groundY) {
-        item.active = false;
-        if (item.kind === KIND_BLOCK && !harmless) state.score += BLOCK.dodgePoints;
-        continue;
+  world.step = function step(fixedStep = STEP) {
+    world.time += fixedStep;
+    world.clock = (world.clock + fixedStep / 60) % (24 * 60);
+    world.notificationTimer = Math.max(0, world.notificationTimer - fixedStep);
+    world.radioVisible = Math.max(0, world.radioVisible - fixedStep);
+    updatePlayer(world.player, world, fixedStep);
+    updateVehicles(world, fixedStep);
+    world.traffic.update(fixedStep);
+    world.peds.update(fixedStep);
+    world.police.update(fixedStep);
+    world.combat.update(fixedStep);
+    world.missions.update(fixedStep);
+    world.jobs.update(fixedStep);
+    world.effects.update(fixedStep, world.camera);
+    if (world.player.vehicle) {
+      const speedRatio = Math.min(1, Math.abs(world.player.vehicle.speed) / world.player.vehicle.type.speed);
+      world.audio?.setEngine(speedRatio, true);
+      if (world.input.isDown('Space') && speedRatio > 0.2) {
+        world.effects.skidMark(world.player.vehicle.x, world.player.vehicle.y, world.player.vehicle.angle);
+        if (world.random() < 0.2) world.audio.screech();
       }
-      if (harmless || !overlaps(item, player)) continue;
-      if (item.kind === KIND_COIN) {
-        item.active = false;
-        state.score += COIN.points;
-        events |= EVENT_COIN;
-      } else if (player.invulnerable === 0) {
-        item.active = false;
-        state.lives -= 1;
-        player.invulnerable = PLAYER.invulnerable;
-        events |= EVENT_HIT;
-        if (state.lives === 0) {
-          events |= EVENT_OVER;
-          break;
-        }
-      }
+    } else {
+      world.audio?.setEngine(0, false);
     }
-    return events;
-  }
+    const nearOcean = world.player.y > 3100;
+    world.audio?.setOcean(nearOcean);
+    const wanted = world.police.state.stars > 0;
+    world.audio?.setSiren(wanted);
+    return true;
+  };
 
-  reset();
-  return { state, reset, step };
+  world.seed = function seed() {
+    world.traffic.seed();
+    world.peds.seed();
+  };
+
+  world.interact = () => playerInteract(world.player, world);
+  world.saveGame = auto => world.save.save(auto);
+  world.damagePlayer = amount => damagePlayer(world.player, amount, world);
+
+  return world;
 }
